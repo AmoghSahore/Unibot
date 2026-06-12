@@ -33,6 +33,7 @@ query_results_*.csv
 chat_history.json
 audit_log.jsonl
 llm_cache.json
+PROJECT_EXPLANATION.txt
 
 # IDE and OS files
 .vscode/
