@@ -12,7 +12,7 @@ from config import get_settings
 from db import DatabaseError, execute_selects
 from llm import LLMError, LLMRateLimitError, get_llm_provider
 from prompts import DATABASE_SCHEMA
-from validator import clean_sql, validate_sql
+from validator import clean_sql, detect_out_of_scope, validate_sql_for_question
 
 
 CHAT_HISTORY_PATH = Path("chat_history.json")
@@ -146,11 +146,19 @@ def normalize_message(message: dict[str, Any]) -> dict[str, Any]:
             "timestamp": message.get("timestamp") or now_iso(),
         }
 
+    answer = str(message.get("natural_language_answer") or message.get("answer", ""))
+    extracted_context = message.get("extracted_context")
+    if not isinstance(extracted_context, dict):
+        extracted_context = {}
+
     return {
         "role": "assistant",
-        "answer": str(message.get("answer", "")),
+        "user_question": str(message.get("user_question", "")),
+        "answer": answer,
+        "natural_language_answer": answer,
         "generated_sql": str(message.get("generated_sql") or message.get("sql") or ""),
         "query_results": message.get("query_results") or [],
+        "extracted_context": extracted_context,
         "timestamp": message.get("timestamp") or now_iso(),
         "status": message.get("status") or ("error" if message.get("error") else "success"),
     }
@@ -179,6 +187,7 @@ def save_chat_history(messages: list[dict[str, Any]]) -> None:
 def clear_chat_history() -> None:
     st.session_state.messages = default_messages()
     st.session_state.pending_question = ""
+    st.session_state.conversation_context = {}
     if CHAT_HISTORY_PATH.exists():
         CHAT_HISTORY_PATH.unlink()
 
@@ -219,6 +228,95 @@ def records_to_dataframe(records: Any) -> pd.DataFrame:
     if isinstance(records, list):
         return pd.DataFrame(records)
     return pd.DataFrame()
+
+
+def is_follow_up_question(question: str) -> bool:
+    normalized = re.sub(r"\s+", " ", question.lower()).strip()
+    return re.search(
+        r"\b(it|its|they|them|their|that|those|this|same|previous|above|mentioned)\b|\bprevious one\b",
+        normalized,
+    ) is not None
+
+
+def _unique_context_values(dataframe: pd.DataFrame, column: str, limit: int = 10) -> list[str]:
+    values = []
+    for value in dataframe[column].dropna().tolist():
+        text_value = str(value).strip()
+        if text_value and text_value not in values:
+            values.append(text_value)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def extract_result_context(question: str, sql: str, dataframe: pd.DataFrame) -> dict[str, Any]:
+    if dataframe.empty:
+        return {}
+
+    column_lookup = {str(column).lower(): str(column) for column in dataframe.columns}
+    context: dict[str, Any] = {}
+
+    entity_columns = (
+        ("department", "last_department", "mentioned_departments"),
+        ("course_name", "last_course", "mentioned_courses"),
+        ("faculty", "last_faculty", "mentioned_faculties"),
+    )
+    for column_name, last_key, mentioned_key in entity_columns:
+        actual_column = column_lookup.get(column_name)
+        if not actual_column:
+            continue
+        values = _unique_context_values(dataframe, actual_column)
+        if values:
+            context[last_key] = values[0]
+            context[mentioned_key] = values
+
+    roll_number_column = column_lookup.get("roll_no")
+    student_name_column = column_lookup.get("name")
+    if roll_number_column:
+        roll_numbers = _unique_context_values(dataframe, roll_number_column)
+        if roll_numbers:
+            context["last_student"] = roll_numbers[0]
+            context["mentioned_students"] = roll_numbers
+    if student_name_column:
+        student_names = _unique_context_values(dataframe, student_name_column)
+        if student_names:
+            context["last_student_name"] = student_names[0]
+            context["mentioned_student_names"] = student_names
+            if "last_student" not in context:
+                context["last_student"] = student_names[0]
+                context["mentioned_students"] = student_names
+
+    if "last_department" not in context:
+        department_match = re.search(
+            r"(?:\b(?:s|c|students|courses)\s*\.\s*)?\bdepartment\b\s*=\s*'([^']+)'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if department_match:
+            context["last_department"] = department_match.group(1)
+            context["mentioned_departments"] = [department_match.group(1)]
+
+    if "last_faculty" not in context:
+        faculty_match = re.search(
+            r"(?:\b(?:c|courses)\s*\.\s*)?\bfaculty\b\s*=\s*'([^']+)'",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if faculty_match:
+            context["last_faculty"] = faculty_match.group(1)
+            context["mentioned_faculties"] = [faculty_match.group(1)]
+
+    return context
+
+
+def latest_conversation_context(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    for message in reversed(messages):
+        if message.get("role") != "assistant" or message.get("status") != "success":
+            continue
+        extracted_context = message.get("extracted_context")
+        if isinstance(extracted_context, dict):
+            return extracted_context
+    return {}
 
 
 def local_result_summary(question: str, dataframe: pd.DataFrame) -> str:
@@ -262,6 +360,31 @@ def clean_repetitive_answer(answer: str, max_sentences: int = 5) -> str:
     return " ".join(cleaned_parts).strip() or answer.strip()
 
 
+def clean_unsupported_answer_claims(question: str, answer: str) -> str:
+    if not answer:
+        return answer
+
+    cleaned = answer.strip()
+    replacements = {
+        r"\bcredits earned\b": "course credits associated with courses",
+        r"\bsuccessfully completed courses\b": "the available enrollment and grade records",
+        r"\bcomplete courses successfully\b": "show stronger available academic metrics",
+        r"\bmanaging (?:their )?courses successfully\b": "showing stronger available academic metrics",
+    }
+
+    for pattern, replacement in replacements.items():
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+
+    asks_for_cause = re.search(r"\bwhy\b|reason|cause|explain", question.lower()) is not None
+    has_causal_wording = re.search(r"\bbecause\b|\bdue to\b|\btherefore\b", cleaned.lower()) is not None
+    has_caveat = "not a confirmed cause" in cleaned.lower() or "exact reason" in cleaned.lower()
+
+    if (asks_for_cause or has_causal_wording) and not has_caveat:
+        cleaned += " The database does not contain enough information to determine the exact reason; this indicates a pattern, not a confirmed cause."
+
+    return cleaned
+
+
 def analytical_result_summary(question: str, dataframe: pd.DataFrame) -> str | None:
     if dataframe.empty:
         return "No matching records were found."
@@ -285,6 +408,62 @@ def analytical_result_summary(question: str, dataframe: pd.DataFrame) -> str | N
         )
 
     return None
+
+
+def build_conversation_context(
+    messages: list[dict[str, Any]],
+    current_question: str,
+    resolved_context: dict[str, Any],
+    max_turns: int = 4,
+) -> str:
+    if not is_follow_up_question(current_question):
+        return ""
+
+    turns = []
+    index = 0
+
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") != "user":
+            index += 1
+            continue
+
+        question = str(message.get("content", "")).strip()
+        generated_sql = ""
+        assistant_answer = ""
+        if index + 1 < len(messages) and messages[index + 1].get("role") == "assistant":
+            generated_sql = str(messages[index + 1].get("generated_sql") or "").strip()
+            assistant_answer = str(
+                messages[index + 1].get("natural_language_answer")
+                or messages[index + 1].get("answer")
+                or ""
+            ).strip()
+
+        if question:
+            turn_lines = [f"User: {question}"]
+            if assistant_answer:
+                turn_lines.append(f"Assistant: {assistant_answer[:500]}")
+            if generated_sql:
+                turn_lines.append(f"SQL: {generated_sql}")
+            turns.append("\n".join(turn_lines))
+
+        index += 1
+
+    context_lines = []
+    for key, value in resolved_context.items():
+        if isinstance(value, list):
+            formatted_value = ", ".join(str(item) for item in value)
+        else:
+            formatted_value = str(value)
+        if formatted_value:
+            context_lines.append(f"- {key}: {formatted_value}")
+
+    sections = []
+    if context_lines:
+        sections.append("Recent resolved context:\n" + "\n".join(context_lines))
+    if turns:
+        sections.append("Recent conversation turns:\n" + "\n\n".join(turns[-max_turns:]))
+    return "\n\n".join(sections)
 
 
 def is_unsafe_request(question: str) -> bool:
@@ -312,18 +491,23 @@ def build_assistant_message(
     generated_sql: str = "",
     dataframe: pd.DataFrame | None = None,
     status: str,
+    user_question: str = "",
+    extracted_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "role": "assistant",
+        "user_question": user_question,
         "answer": answer,
+        "natural_language_answer": answer,
         "generated_sql": generated_sql,
         "query_results": dataframe_to_records(dataframe) if dataframe is not None else [],
+        "extracted_context": extracted_context or {},
         "timestamp": now_iso(),
         "status": status,
     }
 
 
-def run_question(question: str) -> dict[str, Any]:
+def run_question(question: str, conversation_context: str = "") -> dict[str, Any]:
     timestamp = now_iso()
     generated_sql = ""
     status = "error"
@@ -335,21 +519,51 @@ def run_question(question: str) -> dict[str, Any]:
             error_message = "Unsafe query detected. Only SELECT queries are allowed."
             return build_assistant_message(answer=error_message, generated_sql="", status=status)
 
+        is_out_of_scope, scope_reason = detect_out_of_scope(question)
+        if is_out_of_scope:
+            status = "out_of_scope"
+            answer = (
+                "I can't answer that using the current database because it only contains information "
+                f"about students, courses, and enrollments. {scope_reason}"
+            )
+            error_message = scope_reason
+            return build_assistant_message(answer=answer, generated_sql="", status=status)
+
         settings = get_settings()
         llm = get_llm_provider(settings)
-        raw_sql = llm.generate_sql(question)
+        raw_sql = llm.generate_sql(question, conversation_context)
         generated_sql = clean_sql(raw_sql)
-        validation = validate_sql(raw_sql)
+        validation = validate_sql_for_question(question, raw_sql)
 
         if not validation.is_valid:
             if is_security_validation_failure(raw_sql, validation.message):
                 status = "security_blocked"
                 answer = "Unsafe query detected. Only SELECT queries are allowed."
+            elif "not available in the current database" in validation.message:
+                status = "out_of_scope"
+                answer = "I can't answer that because the generated query refers to information not available in the current database."
+                error_message = validation.message
+                return build_assistant_message(answer=answer, generated_sql="", status=status)
             else:
-                status = "error"
-                answer = "I couldn't generate a valid SQL query for that request."
-            error_message = answer
-            return build_assistant_message(answer=answer, generated_sql=generated_sql, status=status)
+                repaired_sql = clean_sql(llm.repair_sql(question, raw_sql, validation.message, conversation_context))
+                repaired_validation = validate_sql_for_question(question, repaired_sql)
+                if repaired_validation.is_valid:
+                    validation = repaired_validation
+                    generated_sql = repaired_validation.sql
+                else:
+                    if "not available in the current database" in repaired_validation.message:
+                        status = "out_of_scope"
+                        answer = "I can't answer that because the generated query refers to information not available in the current database."
+                        error_message = repaired_validation.message
+                        return build_assistant_message(answer=answer, generated_sql="", status=status)
+                    status = "error"
+                    answer = "I couldn't generate a valid SQL query for that request."
+                    error_message = f"{answer} {repaired_validation.message}".strip()
+                    return build_assistant_message(answer=answer, generated_sql=generated_sql, status=status)
+
+            if status == "security_blocked":
+                error_message = answer
+                return build_assistant_message(answer=answer, generated_sql=generated_sql, status=status)
 
         result = execute_selects(validation.sql)
         generated_sql = validation.sql
@@ -361,6 +575,7 @@ def run_question(question: str) -> dict[str, Any]:
                 generated_sql=generated_sql,
                 dataframe=result.dataframe,
                 status=status,
+                user_question=question,
             )
 
         analytical_answer = analytical_result_summary(question, result.dataframe)
@@ -371,6 +586,8 @@ def run_question(question: str) -> dict[str, Any]:
             answer = clean_repetitive_answer(llm.summarize_results(question, validation.sql, prompt_results))
         else:
             answer = local_result_summary(question, result.dataframe)
+        answer = clean_unsupported_answer_claims(question, answer)
+        extracted_context = extract_result_context(question, generated_sql, result.dataframe)
         status = "success"
 
         return build_assistant_message(
@@ -378,6 +595,8 @@ def run_question(question: str) -> dict[str, Any]:
             generated_sql=generated_sql,
             dataframe=result.dataframe,
             status=status,
+            user_question=question,
+            extracted_context=extracted_context,
         )
     except LLMRateLimitError as exc:
         status = "error"
@@ -444,9 +663,18 @@ def render_assistant_message(message: dict[str, Any], index: int, developer_mode
 
 
 def process_question(question: str) -> None:
+    conversation_context = build_conversation_context(
+        st.session_state.messages,
+        question,
+        st.session_state.conversation_context,
+    )
     user_message = {"role": "user", "content": question, "timestamp": now_iso()}
     st.session_state.messages.append(user_message)
-    assistant_message = run_question(question)
+    assistant_message = run_question(question, conversation_context)
+    assistant_message["user_question"] = question
+    assistant_message["natural_language_answer"] = assistant_message.get("answer", "")
+    if assistant_message.get("status") in {"success", "no_results"}:
+        st.session_state.conversation_context = assistant_message.get("extracted_context") or {}
     st.session_state.messages.append(assistant_message)
     save_chat_history(st.session_state.messages)
 
@@ -473,6 +701,9 @@ if "pending_question" not in st.session_state:
 
 if "active_request_key" not in st.session_state:
     st.session_state.active_request_key = ""
+
+if "conversation_context" not in st.session_state:
+    st.session_state.conversation_context = latest_conversation_context(st.session_state.messages)
 
 
 with st.sidebar:

@@ -1,0 +1,627 @@
+UNIVERSITY TEXT-TO-SQL CHATBOT
+PROJECT EXPLANATION
+
+1. SYSTEM OVERVIEW
+
+This project is a Text-to-SQL university chatbot. It accepts questions in
+plain English, translates them into safe MySQL SELECT queries, executes those
+queries, and returns the results through a Streamlit chat interface.
+
+High-level pipeline:
+
+User question
+-> Security and scope checks
+-> Optional conversational context
+-> Groq generates SQL
+-> SQL validation
+-> One repair attempt if needed
+-> MySQL execution
+-> Result summarization
+-> Context extraction
+-> Chat history and audit logging
+
+
+2. PROJECT FILES
+
+app.py
+------
+This is the main application and orchestration file. It builds the Streamlit
+interface and controls the full request lifecycle.
+
+Its responsibilities include:
+
+- Configuring and styling the Streamlit page.
+- Rendering user and assistant chat messages.
+- Providing Developer Mode, example questions, schema display, and CSV export.
+- Loading, normalizing, saving, and clearing chat history.
+- Blocking unsafe user requests before calling the LLM.
+- Checking whether questions are outside the database scope.
+- Building conversational context for follow-up questions.
+- Calling Groq to generate SQL.
+- Sending generated SQL through validation and one repair attempt.
+- Executing only validated SQL.
+- Formatting query results into natural-language answers.
+- Extracting useful entities from successful results for follow-up questions.
+- Recording every request in the audit log.
+
+config.py
+---------
+This file loads configuration from the .env file using python-dotenv. It
+defines an immutable Settings dataclass containing:
+
+- GROQ_API_KEY
+- GROQ_MODEL
+- USE_LLM_FOR_RESULT_SUMMARY
+- MYSQL_HOST
+- MYSQL_PORT
+- MYSQL_USER
+- MYSQL_PASSWORD
+- MYSQL_DATABASE
+
+Centralizing configuration prevents API keys and database credentials from
+being hardcoded throughout the codebase.
+
+prompts.py
+----------
+This file contains the database schema description and all prompts sent to
+Groq.
+
+build_sql_prompt() instructs Groq to:
+
+- Return executable MySQL SELECT statements only.
+- Use only tables and columns that exist in the schema.
+- Avoid destructive operations.
+- Use the smallest necessary set of tables.
+- Avoid unnecessary joins and duplicate rows.
+- Include every GROUP BY dimension in SELECT.
+- Use safe DISTINCT counts after joins.
+- Select only metrics requested by the user.
+- Apply semantic table-selection rules.
+- Use resolved conversation context only for ambiguous follow-ups.
+
+build_answer_prompt() instructs Groq to explain database results without
+inventing unsupported facts or causes.
+
+build_sql_repair_prompt() receives invalid SQL and its validation error. It
+asks Groq to repair the query once while following the same schema, security,
+grouping, aggregate, and table-selection rules.
+
+llm.py
+------
+This file contains the LLM abstraction and Groq implementation.
+
+LLMProvider defines three operations:
+
+- generate_sql()
+- repair_sql()
+- summarize_results()
+
+GroqProvider implements these operations using Groq chat completions with
+temperature 0 for more deterministic output.
+
+Task-specific token limits are used:
+
+- SQL generation: 700 tokens
+- SQL repair: 700 tokens
+- Result summary: 350 tokens
+
+The file also provides:
+
+- A local cache in llm_cache.json.
+- SHA-256 cache keys based on model, task type, and complete prompt.
+- Retries for temporary rate-limit and service errors.
+- Retry delays of 5, 10, and 20 seconds.
+- Friendly exceptions for missing API keys, rate limits, and unavailable LLM
+  service.
+
+validator.py
+------------
+This file is the main safety and correctness layer. It uses lightweight,
+rule-based SQL parsing rather than a full SQL parser.
+
+It performs:
+
+- Question-level out-of-scope detection.
+- SQL cleanup and multi-statement splitting.
+- SELECT-only security validation.
+- Blocked-keyword validation.
+- Schema table and column validation.
+- Derived-subquery alias validation.
+- GROUP BY correctness validation.
+- Aggregate safety validation.
+- Semantic table-selection validation based on the user question.
+
+db.py
+-----
+This file handles MySQL connectivity and execution.
+
+get_connection() creates a connection using settings from config.py.
+
+execute_select() runs one SELECT statement using a dictionary cursor, fetches
+the rows, and converts them into a pandas DataFrame.
+
+execute_selects() supports multiple validated SELECT statements. It executes
+them sequentially and adds a query_number field so their results can be
+distinguished.
+
+Connections and cursors are always closed in finally blocks.
+
+sql/schema.sql
+--------------
+This file creates and seeds the university_db MySQL database.
+
+It defines the students, courses, and enrollments tables, their constraints,
+foreign keys, and demonstration records.
+
+testGroq.py
+-----------
+This is a small connectivity test. It loads the Groq credentials, sends a
+simple prompt, and prints the response. It verifies the API key, model, Groq
+package, and network connection independently of Streamlit and MySQL.
+
+requirements.txt
+----------------
+This file pins the Python dependencies required by the project:
+
+- streamlit==1.41.1
+- groq==0.13.1
+- mysql-connector-python==9.1.0
+- python-dotenv==1.0.1
+- pandas==2.2.3
+
+.env.example
+------------
+This is a safe environment-variable template. It documents the configuration
+required to run the app without containing real secrets.
+
+.gitignore
+----------
+This prevents private and generated files from being committed, including:
+
+- .env
+- chat_history.json
+- audit_log.jsonl
+- llm_cache.json
+- Python caches
+- virtual environments
+- IDE and operating-system files
+
+README.md
+---------
+This contains project setup, architecture, usage, security information, and
+example questions. Its older statement that conversational context is future
+work should be updated because lightweight result-aware context is now
+implemented.
+
+
+3. DATABASE SCHEMA
+
+students
+--------
+
+- roll_no: unique student identifier and primary key
+- name: student name
+- department: academic department
+- cgpa: CGPA from 0 to 10
+- attendance: attendance percentage from 0 to 100
+- semester: current semester
+
+courses
+-------
+
+- course_id: unique course identifier and primary key
+- course_name: course title
+- faculty: faculty member teaching the course
+- credits: credits associated with the course
+- department: department offering the course
+
+enrollments
+-----------
+
+- enrollment_id: unique enrollment record and primary key
+- roll_no: foreign key referencing students.roll_no
+- course_id: foreign key referencing courses.course_id
+- grade: recorded letter grade
+
+Relationships:
+
+students.roll_no = enrollments.roll_no
+courses.course_id = enrollments.course_id
+
+The enrollments table creates a many-to-many relationship between students
+and courses.
+
+
+4. COMPLETE REQUEST PIPELINE
+
+Step 1: User input
+------------------
+
+The user enters a question through st.chat_input(). The question can also come
+from an example button in the sidebar.
+
+Step 2: Duplicate-request protection
+------------------------------------
+
+process_question_once() builds an active request key from the question and
+current message count. This prevents Streamlit reruns from processing the same
+request twice.
+
+Step 3: Unsafe request detection
+--------------------------------
+
+is_unsafe_request() checks the natural-language request for destructive intent
+such as DELETE, DROP, UPDATE, INSERT, ALTER, or TRUNCATE.
+
+Unsafe requests are blocked before Groq or MySQL is called.
+
+Step 4: Out-of-scope detection
+------------------------------
+
+detect_out_of_scope() checks for concepts that do not exist in the database,
+including hostel, bus, address, scholarship, fees, classroom, library,
+placements, salary, phone, and email.
+
+For example, "Which hostel has the most students?" is rejected because no
+hostel data exists. No SQL is generated or executed.
+
+This is different from a valid query returning zero records. An out-of-scope
+question requires unavailable fields; a no-results query uses valid fields but
+finds no matching rows.
+
+Step 5: Follow-up context construction
+--------------------------------------
+
+is_follow_up_question() identifies ambiguous references such as:
+
+it, its, they, them, their, that, those, this, same, previous, above, mentioned
+
+Only follow-up questions receive prior context. Self-contained questions get
+an empty context block so stale filters do not affect them.
+
+The context can contain:
+
+- Previous user questions.
+- Previous assistant answers.
+- Previous generated SQL.
+- Resolved entities extracted from the latest successful result.
+
+Step 6: SQL generation
+----------------------
+
+Groq receives the SQL prompt containing the schema, user question, SQL rules,
+examples, and optional resolved context. It returns SQL text only.
+
+Step 7: SQL cleanup
+-------------------
+
+clean_sql() removes markdown fences and unnecessary surrounding whitespace.
+
+Step 8: SQL validation
+----------------------
+
+validate_sql_for_question() combines general SQL validation with question-aware
+semantic validation.
+
+If validation fails for a repairable reason, the invalid SQL and error message
+are sent to Groq once.
+
+Step 9: Single repair attempt
+-----------------------------
+
+The repaired SQL is run through the complete validator again. If it still
+fails, the app returns an error and does not execute it. This prevents infinite
+repair loops.
+
+Step 10: MySQL execution
+------------------------
+
+Only validated SQL reaches execute_selects(). Results are returned as a pandas
+DataFrame.
+
+Step 11: Empty-result handling
+------------------------------
+
+If the DataFrame has no rows, the assistant responds:
+
+No matching records were found.
+
+No LLM result-summary call is made for an empty result.
+
+Step 12: Answer generation
+--------------------------
+
+For non-empty results, the app may use:
+
+- A deterministic local analytical summary.
+- Groq result summarization when USE_LLM_FOR_RESULT_SUMMARY=True.
+- A local fallback summary when that setting is False.
+
+Step 13: Answer cleanup
+-----------------------
+
+clean_repetitive_answer() removes repeated sentences and limits normal answers
+to five sentences.
+
+clean_unsupported_answer_claims() replaces unsupported phrases and adds a
+causal limitation when an answer makes or is asked for causal claims.
+
+Step 14: Context extraction
+---------------------------
+
+extract_result_context() extracts useful entities from the successful result:
+
+- last_department and mentioned_departments
+- last_course and mentioned_courses
+- last_faculty and mentioned_faculties
+- last_student and mentioned_students
+- student names when available
+
+This enables follow-ups such as:
+
+User: Which department has the highest average CGPA?
+Assistant result: CSE
+User: What about its attendance?
+
+The word "its" can be resolved to CSE.
+
+Step 15: Persistence and auditing
+---------------------------------
+
+The assistant message and extracted context are saved in chat_history.json.
+Every request attempt is also appended to audit_log.jsonl.
+
+
+5. SQL VALIDATION RULES
+
+SELECT-only security
+--------------------
+
+Every statement must begin with SELECT. Blocked keywords include INSERT,
+UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, REPLACE, MERGE, GRANT, REVOKE,
+CALL, EXECUTE, LOAD, OUTFILE, and DUMPFILE.
+
+Multiple statements
+-------------------
+
+At most five SELECT statements are allowed. The splitter tracks parentheses
+and quoted strings so it does not split inside a subquery or string literal.
+
+Schema validation
+-----------------
+
+Only students, courses, and enrollments are allowed. Columns are checked
+against the actual table schema. Invented identifiers such as hostel_name,
+fee, or address are rejected.
+
+GROUP BY validation
+-------------------
+
+Every grouping dimension must appear in SELECT.
+
+Rejected:
+
+SELECT COUNT(*) FROM students GROUP BY department
+
+Accepted:
+
+SELECT department, COUNT(*) FROM students GROUP BY department
+
+Derived-subquery validation
+---------------------------
+
+An outer query may only reference columns explicitly projected by a subquery.
+For example, course_stats.faculty_count is valid only if faculty_count is
+selected inside the course_stats subquery.
+
+Aggregate safety
+----------------
+
+Common duplicate-prone aggregates are rejected. Safer forms include:
+
+- COUNT(DISTINCT s.roll_no) for students
+- COUNT(DISTINCT c.course_id) for courses
+- COUNT(DISTINCT c.faculty) for faculty
+- COUNT(e.enrollment_id) for enrollment records
+
+The prompt recommends safe grouped subqueries for department-level statistics
+so one-to-many joins do not multiply counts or averages.
+
+Semantic table selection
+------------------------
+
+The validator considers the question's meaning, not only SQL syntax.
+
+A simple course lookup such as "Which courses are taught by Dr. Sharma?"
+should query courses directly.
+
+A student lookup such as "Which students are taught by Dr. Sharma?" requires
+courses joined to enrollments and students, so that join is allowed.
+
+
+6. CONVERSATIONAL CONTEXT
+
+The project uses lightweight state, not full memory, vector storage, or RAG.
+
+For every successful assistant response, it stores:
+
+- user_question
+- generated_sql
+- natural_language_answer
+- query_results
+- extracted_context
+
+Resolved context is injected only when the next question contains an ambiguous
+reference. Singular references use last_* values, while plural references can
+use mentioned_* lists with SQL IN clauses.
+
+Each successful response replaces the current entity snapshot. This limits
+stale-context errors and keeps the context small.
+
+
+7. RESULT AND ANSWER RELIABILITY
+
+The answer prompt includes the schema, SQL query, and database results. It
+instructs Groq to make only claims supported by those results.
+
+It specifically avoids unsupported claims about:
+
+- teaching quality
+- student motivation or effort
+- course difficulty
+- successful completion
+- exact causes of performance
+
+For "why" questions, the answer should explain observed patterns while stating
+that the database cannot confirm causality.
+
+
+8. DEVELOPER MODE
+
+Developer Mode is disabled by default. When enabled, it displays:
+
+- Request status
+- Generated SQL
+- Raw query results
+- CSV download button
+
+This is useful for debugging, demonstrations, and validating that the generated
+SQL matches the user's intent.
+
+
+9. CHAT HISTORY, AUDIT LOGS, AND CACHE
+
+chat_history.json
+-----------------
+
+Stores persistent user and assistant messages, generated SQL, results,
+statuses, and extracted context. It allows the chat to survive Streamlit
+restarts.
+
+audit_log.jsonl
+---------------
+
+Stores one JSON object per request with:
+
+- timestamp
+- user question
+- generated SQL
+- status
+- error message
+
+Possible statuses include success, no_results, security_blocked,
+out_of_scope, and error.
+
+llm_cache.json
+--------------
+
+Stores Groq responses indexed by a SHA-256 hash. This reduces repeated API
+usage during testing. It does not store the API key or database password.
+
+
+10. TECHNOLOGIES USED
+
+Python
+------
+The main application language.
+
+Streamlit 1.41.1
+----------------
+Provides the chat interface, sidebar, state management, data tables, and CSV
+downloads.
+
+Groq 0.13.1
+-----------
+Provides LLM inference for SQL generation, SQL repair, and optional result
+summarization.
+
+MySQL
+-----
+Stores the relational university data.
+
+mysql-connector-python 9.1.0
+----------------------------
+Connects Python to MySQL and executes validated queries.
+
+pandas 2.2.3
+------------
+Represents query results as DataFrames for display, summarization, context
+extraction, and CSV export.
+
+python-dotenv 1.0.1
+-------------------
+Loads environment variables from .env.
+
+JSON and JSONL
+--------------
+Provide lightweight local persistence for chat history, caching, and audit
+logs.
+
+
+11. CONFIGURATION
+
+The .env file contains real local values such as:
+
+GROQ_API_KEY
+GROQ_MODEL
+USE_LLM_FOR_RESULT_SUMMARY
+MYSQL_HOST
+MYSQL_PORT
+MYSQL_USER
+MYSQL_PASSWORD
+MYSQL_DATABASE
+
+The .env.example file documents these variables without exposing secrets.
+
+Setting USE_LLM_FOR_RESULT_SUMMARY=False prevents result rows from being sent
+to Groq for summarization. Groq is then used only for SQL generation and SQL
+repair.
+
+
+12. SECURITY MODEL
+
+The LLM never connects directly to MySQL. It only returns SQL text.
+
+The application controls execution:
+
+Groq SQL output
+-> local validation
+-> optional single repair
+-> complete revalidation
+-> local MySQL execution
+
+This separates probabilistic SQL generation from deterministic execution
+control.
+
+The current project is appropriate for an MVP or demonstration. A production
+version should additionally include authentication, authorization, role-based
+access control, rate limiting, encrypted secret management, audit retention,
+and stricter SQL parsing or read-only database credentials.
+
+
+13. RUNNING THE PROJECT
+
+1. Install dependencies:
+
+pip install -r requirements.txt
+
+2. Create .env from .env.example and fill in the credentials.
+
+3. Create and seed the MySQL database:
+
+mysql -u root -p < sql/schema.sql
+
+4. Start the chatbot:
+
+streamlit run app.py
+
+
+14. INTERVIEW SUMMARY
+
+This project uses an LLM for natural-language understanding and SQL generation,
+but it does not trust the LLM output directly. The application validates query
+security, schema usage, grouping logic, aggregate safety, derived aliases, and
+semantic table selection before execution. Invalid SQL receives at most one
+repair attempt. Validated queries run locally against MySQL, results are
+returned through Streamlit, and lightweight entity context supports follow-up
+questions without requiring RAG or vector memory.
