@@ -22,7 +22,6 @@ BLOCKED_KEYWORDS = {
 }
 
 MAX_SELECT_STATEMENTS = 5
-GRADE_VALIDATION_ERROR = "Invalid grade aggregation detected. Letter grades must be mapped using CASE before aggregation."
 
 
 @dataclass(frozen=True)
@@ -139,74 +138,3 @@ def validate_sql(raw_sql: str) -> ValidationResult:
         validated_statements.append(normalized)
 
     return ValidationResult(True, ";\n".join(validated_statements))
-
-
-def validate_domain_sql(sql: str) -> tuple[bool, str]:
-    cleaned = clean_sql(sql)
-    normalized = re.sub(r"\s+", " ", cleaned).strip()
-    lowered = normalized.lower()
-
-    invalid_patterns = [
-        r"\bavg\s*\(\s*(?:e\.)?grade\s*\)",
-        r"\b(?:e\.)?grade\s*(?:<|>|<=|>=)",
-        r"(?:<|>|<=|>=)\s*(?:e\.)?grade\b",
-        r"\b(?:min|max|sum)\s*\(\s*(?:e\.)?grade\s*\)",
-        r"case\s+when\s+(?:e\.)?grade\s*(?:<|>|<=|>=)",
-    ]
-
-    for pattern in invalid_patterns:
-        if re.search(pattern, lowered):
-            return False, GRADE_VALIDATION_ERROR
-
-    mentions_grade_performance = any(
-        marker in lowered
-        for marker in (
-            "average_grade",
-            "average grade",
-            "grade performance",
-            "low_grade",
-            "low grade",
-            "weakest",
-            "strongest",
-        )
-    )
-    references_grade = re.search(r"\b(?:e\.)?grade\b", lowered) is not None
-    uses_grade_aggregate = re.search(r"\b(avg|sum|count|min|max)\s*\(", lowered) is not None and references_grade
-    uses_simple_case_mapping = all(
-        token in lowered
-        for token in (
-            "case",
-            "when 'a' then 4",
-            "when 'b' then 3",
-            "when 'c' then 2",
-            "when 'd' then 1",
-        )
-    )
-    uses_searched_case_mapping = all(
-        token in lowered
-        for token in (
-            "case",
-            "grade = 'a' then 4",
-            "grade = 'b' then 3",
-            "grade = 'c' then 2",
-            "grade = 'd' then 1",
-        )
-    )
-    uses_case_mapping = uses_simple_case_mapping or uses_searched_case_mapping
-
-    if (mentions_grade_performance or uses_grade_aggregate) and references_grade and not uses_case_mapping:
-        return False, GRADE_VALIDATION_ERROR
-
-    low_grade_alias_used = "low_grade_count" in lowered
-    low_grade_count_wrong = (
-        low_grade_alias_used
-        and "grade in ('c', 'd')" not in lowered
-        and 'grade in ("c", "d")' not in lowered
-    )
-    if low_grade_count_wrong:
-        return False, GRADE_VALIDATION_ERROR
-
-    if "average_grade_score" in lowered and not uses_case_mapping:
-        return False, GRADE_VALIDATION_ERROR
-
-    return True, ""

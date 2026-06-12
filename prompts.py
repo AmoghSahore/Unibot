@@ -55,73 +55,12 @@ Preferred aliases:
 - enrollments AS e
 - courses AS c
 
-Grade domain rules:
-- enrollments.grade is text containing A, B, C, or D.
-- Never use AVG(grade) or AVG(e.grade) directly.
-- Never compare grade letters using <, >, <=, or >=.
-- For grade performance, map letters with CASE: A = 4, B = 3, C = 2, D = 1.
-- For average grade performance, use:
-AVG(
-CASE
-WHEN e.grade = 'A' THEN 4
-WHEN e.grade = 'B' THEN 3
-WHEN e.grade = 'C' THEN 2
-WHEN e.grade = 'D' THEN 1
-ELSE NULL
-END
-) AS average_grade_score
-- For low-grade count, use:
-SUM(CASE WHEN e.grade IN ('C', 'D') THEN 1 ELSE 0 END) AS low_grade_count
-- For strongest courses, use ORDER BY average_grade_score DESC, low_grade_count ASC.
-- For weakest courses, use ORDER BY low_grade_count DESC, average_grade_score ASC.
-
 Example:
 SELECT COUNT(DISTINCT s.roll_no) AS student_count, COUNT(DISTINCT c.faculty) AS faculty_count
 FROM students AS s
 JOIN enrollments AS e ON s.roll_no = e.roll_no
 JOIN courses AS c ON e.course_id = c.course_id
 WHERE s.department = 'CSE'
-
-Grade performance example question:
-For each course, show total enrolled students, average grade performance, and low grade count.
-
-Expected SQL:
-SELECT
-c.course_name,
-c.faculty,
-c.department,
-enrolled.enrolled_students,
-score.average_grade_score,
-low.low_grade_count
-FROM courses AS c
-JOIN (
-    SELECT e.course_id, COUNT(DISTINCT e.roll_no) AS enrolled_students
-    FROM enrollments AS e
-    GROUP BY e.course_id
-) AS enrolled ON c.course_id = enrolled.course_id
-JOIN (
-    SELECT
-    e.course_id,
-    ROUND(AVG(
-    CASE
-    WHEN e.grade = 'A' THEN 4
-    WHEN e.grade = 'B' THEN 3
-    WHEN e.grade = 'C' THEN 2
-    WHEN e.grade = 'D' THEN 1
-    ELSE NULL
-    END
-    ), 2) AS average_grade_score
-    FROM enrollments AS e
-    GROUP BY e.course_id
-) AS score ON c.course_id = score.course_id
-JOIN (
-    SELECT
-    e.course_id,
-    SUM(CASE WHEN e.grade IN ('C', 'D') THEN 1 ELSE 0 END) AS low_grade_count
-    FROM enrollments AS e
-    GROUP BY e.course_id
-) AS low ON c.course_id = low.course_id
-ORDER BY low.low_grade_count DESC, score.average_grade_score ASC
 
 Database Schema:
 {DATABASE_SCHEMA}
@@ -160,51 +99,4 @@ If the user asks why, asks for reasons, asks for causes, or asks you to explain 
 - Clearly state that the database can show patterns but may not contain causal explanations.
 - Do not claim causes such as teaching quality, student behavior, syllabus difficulty, or personal reasons unless those fields are directly present in the results.
 - Add this line when useful: Insight: This is a pattern-based observation, not a confirmed cause.
-
-If the results include average_grade_score, explain that it is derived using A=4, B=3, C=2, and D=1.
-If the results include low_grade_count, explain that it counts C and D grades.
-Do not say "average grade is 0.0" unless the validated result actually contains 0.0.
-""".strip()
-
-
-def build_sql_repair_prompt(user_question: str, invalid_sql: str, validation_error: str) -> str:
-    return f"""
-You are an expert MySQL assistant.
-
-The SQL below was rejected:
-{invalid_sql}
-
-Reason:
-{validation_error}
-
-Rewrite it as valid MySQL SELECT SQL.
-Return only executable SQL.
-Do not use markdown.
-Do not explain.
-Do not use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or other data-changing statements.
-
-Mandatory grade rules:
-- Never use AVG(grade) or AVG(e.grade) directly.
-- Never compare grade letters using <, >, <=, or >=.
-- Convert grades with CASE: A=4, B=3, C=2, D=1.
-- Use this exact average expression when calculating grade performance:
-AVG(
-CASE
-WHEN e.grade = 'A' THEN 4
-WHEN e.grade = 'B' THEN 3
-WHEN e.grade = 'C' THEN 2
-WHEN e.grade = 'D' THEN 1
-ELSE NULL
-END
-) AS average_grade_score
-- Use this exact low-grade expression:
-SUM(CASE WHEN e.grade IN ('C', 'D') THEN 1 ELSE 0 END) AS low_grade_count
-- For strongest courses, ORDER BY average_grade_score DESC, low_grade_count ASC.
-- For weakest courses, ORDER BY low_grade_count DESC, average_grade_score ASC.
-
-Database Schema:
-{DATABASE_SCHEMA}
-
-Original question:
-{user_question}
 """.strip()

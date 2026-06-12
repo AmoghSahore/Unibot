@@ -12,50 +12,11 @@ from config import get_settings
 from db import DatabaseError, execute_selects
 from llm import LLMError, LLMRateLimitError, get_llm_provider
 from prompts import DATABASE_SCHEMA
-from validator import clean_sql, validate_domain_sql, validate_sql
+from validator import clean_sql, validate_sql
 
 
 CHAT_HISTORY_PATH = Path("chat_history.json")
 AUDIT_LOG_PATH = Path("audit_log.jsonl")
-
-COURSE_GRADE_PERFORMANCE_SQL = """
-SELECT
-c.course_name,
-c.faculty,
-c.department,
-enrolled.enrolled_students,
-score.average_grade_score,
-low.low_grade_count
-FROM courses AS c
-JOIN (
-    SELECT e.course_id, COUNT(DISTINCT e.roll_no) AS enrolled_students
-    FROM enrollments AS e
-    GROUP BY e.course_id
-) AS enrolled ON c.course_id = enrolled.course_id
-JOIN (
-    SELECT
-    e.course_id,
-    ROUND(AVG(
-    CASE
-    WHEN e.grade = 'A' THEN 4
-    WHEN e.grade = 'B' THEN 3
-    WHEN e.grade = 'C' THEN 2
-    WHEN e.grade = 'D' THEN 1
-    ELSE NULL
-    END
-    ), 2) AS average_grade_score
-    FROM enrollments AS e
-    GROUP BY e.course_id
-) AS score ON c.course_id = score.course_id
-JOIN (
-    SELECT
-    e.course_id,
-    SUM(CASE WHEN e.grade IN ('C', 'D') THEN 1 ELSE 0 END) AS low_grade_count
-    FROM enrollments AS e
-    GROUP BY e.course_id
-) AS low ON c.course_id = low.course_id
-ORDER BY low.low_grade_count DESC, score.average_grade_score ASC
-""".strip()
 
 
 st.set_page_config(page_title="University SQL Assistant", page_icon="🎓", layout="wide")
@@ -305,23 +266,6 @@ def analytical_result_summary(question: str, dataframe: pd.DataFrame) -> str | N
     if dataframe.empty:
         return "No matching records were found."
 
-    columns = set(dataframe.columns)
-
-    if {"course_name", "average_grade_score", "low_grade_count"}.issubset(columns):
-        top_rows = dataframe.head(5)
-        course_names = ", ".join(str(name) for name in top_rows["course_name"].tolist())
-        first = top_rows.iloc[0]
-        answer = (
-            f"The weakest courses by grade pattern are {course_names}. "
-            f"{first['course_name']} has the highest low-grade count ({first['low_grade_count']}) "
-            f"with an average grade score of {first['average_grade_score']}. "
-            "average_grade_score is calculated using A=4, B=3, C=2, and D=1. "
-            "low_grade_count counts C and D grades."
-        )
-        if re.search(r"\bwhy\b|reason|cause|explain", question.lower()):
-            answer += " Insight: This is a pattern-based observation, not a confirmed cause."
-        return answer
-
     numeric_columns = []
     for column in dataframe.columns:
         series = dataframe[column]
@@ -341,50 +285,6 @@ def analytical_result_summary(question: str, dataframe: pd.DataFrame) -> str | N
         )
 
     return None
-
-
-def is_grade_performance_question(question: str) -> bool:
-    normalized = question.lower()
-    patterns = (
-        "course performance",
-        "subject performance",
-        "weakest subjects",
-        "weakest courses",
-        "strongest subjects",
-        "strongest courses",
-        "best grade performance",
-        "low grades",
-        "average grade performance",
-        "total enrolled students per course",
-        "most low grades",
-        "grade performance",
-    )
-    return any(pattern in normalized for pattern in patterns)
-
-
-def validate_or_repair_domain_sql(question: str, sql: str, llm: Any) -> tuple[bool, str, str]:
-    is_valid, message = validate_domain_sql(sql)
-    if is_valid:
-        return True, sql, ""
-
-    try:
-        repaired_sql = clean_sql(llm.repair_sql(question, sql, message))
-    except LLMError:
-        repaired_sql = ""
-
-    if repaired_sql:
-        general_validation = validate_sql(repaired_sql)
-        domain_validation = validate_domain_sql(general_validation.sql if general_validation.is_valid else repaired_sql)
-        if general_validation.is_valid and domain_validation[0]:
-            return True, general_validation.sql, ""
-
-    if is_grade_performance_question(question):
-        fallback_validation = validate_sql(COURSE_GRADE_PERFORMANCE_SQL)
-        fallback_domain_validation = validate_domain_sql(fallback_validation.sql)
-        if fallback_validation.is_valid and fallback_domain_validation[0]:
-            return True, fallback_validation.sql, ""
-
-    return False, sql, message
 
 
 def is_unsafe_request(question: str) -> bool:
@@ -450,18 +350,6 @@ def run_question(question: str) -> dict[str, Any]:
                 answer = "I couldn't generate a valid SQL query for that request."
             error_message = answer
             return build_assistant_message(answer=answer, generated_sql=generated_sql, status=status)
-
-        domain_valid, domain_sql, domain_message = validate_or_repair_domain_sql(question, validation.sql, llm)
-        if not domain_valid:
-            status = "error"
-            error_message = domain_message
-            return build_assistant_message(answer=domain_message, generated_sql=validation.sql, status=status)
-
-        validation = validate_sql(domain_sql)
-        if not validation.is_valid:
-            status = "error"
-            error_message = "I couldn't generate a valid SQL query for that request."
-            return build_assistant_message(answer=error_message, generated_sql=domain_sql, status=status)
 
         result = execute_selects(validation.sql)
         generated_sql = validation.sql

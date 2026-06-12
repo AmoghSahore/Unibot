@@ -8,14 +8,13 @@ from typing import Any
 from groq import Groq
 
 from config import Settings, get_settings
-from prompts import build_answer_prompt, build_sql_prompt, build_sql_repair_prompt
+from prompts import build_answer_prompt, build_sql_prompt
 
 
 LLM_CACHE_PATH = Path("llm_cache.json")
 RETRY_DELAYS_SECONDS = (5, 10, 20)
 TASK_MAX_TOKENS = {
     "sql_generation": 700,
-    "sql_repair": 700,
     "result_summary": 350,
 }
 
@@ -36,11 +35,6 @@ class LLMProvider(ABC):
     @abstractmethod
     def summarize_results(self, question: str, sql: str, results: str) -> str:
         raise NotImplementedError
-
-    @abstractmethod
-    def repair_sql(self, question: str, invalid_sql: str, validation_error: str) -> str:
-        raise NotImplementedError
-
 
 def _load_cache() -> dict[str, str]:
     if not LLM_CACHE_PATH.exists():
@@ -138,13 +132,6 @@ class GroqProvider(LLMProvider):
 
     def summarize_results(self, question: str, sql: str, results: str) -> str:
         return self._generate_text(build_answer_prompt(question, sql, results), task_type="result_summary")
-
-    def repair_sql(self, question: str, invalid_sql: str, validation_error: str) -> str:
-        return self._generate_text(
-            build_sql_repair_prompt(question, invalid_sql, validation_error),
-            task_type="sql_repair",
-        )
-
 
 def get_llm_provider(settings: Settings | None = None) -> LLMProvider:
     return GroqProvider(settings)
